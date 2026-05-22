@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
 from datetime import datetime
-import re, zipfile, unicodedata
+import re, zipfile, unicodedata, shutil
 from io import BytesIO
 import pandas as pd
 import streamlit as st
@@ -203,7 +203,7 @@ def conciliar(nfs,comps,lim_auto,lim_manual):
     return res,usados
 
 def unir_pdfs(nf,comp,pasta):
-    pasta=Path(pasta); pasta.mkdir(parents=True, exist_ok=True); caminho=pasta/f"NF_{limpar_nome_arquivo(nf.get('numero_nf'))}_{limpar_nome_arquivo(nf.get('fornecedor'))}.pdf"; writer=PdfWriter()
+    pasta=Path(pasta); pasta.mkdir(parents=True, exist_ok=True); valor_nome=str(nf.get('valor_bruto') or '').replace('.', '_'); caminho=pasta/f"{limpar_nome_arquivo(nf.get('fornecedor'))}_NF_{limpar_nome_arquivo(nf.get('numero_nf'))}_{valor_nome}.pdf"; writer=PdfWriter()
     for arq in [nf['arquivo'], comp['arquivo_pagina']]:
         reader=PdfReader(str(arq))
         for page in reader.pages: writer.add_page(page)
@@ -218,8 +218,30 @@ def zipar_pasta(pasta):
 def linha(status,score,mot,simn,simt,nf,comp,pdf='',tipo='Resultado',empate=False):
     return {'tipo_linha':tipo,'status':status,'score':score,'empate_proximo':'Sim' if empate else 'Não','motivos_match':mot,'similaridade_nome':simn,'similaridade_texto':simt,'nf_numero':nf.get('numero_nf','') if nf else '','nf_fornecedor':nf.get('fornecedor','') if nf else '','nf_cnpj':nf.get('cnpj','') if nf else '','nf_valor_bruto':nf.get('valor_bruto','') if nf else '','nf_valor_bruto_formatado':formatar_valor(nf.get('valor_bruto')) if nf else '','nf_valor_liquido_estimado':nf.get('valor_liquido_estimado','') if nf else '','nf_valor_liquido_formatado':formatar_valor(nf.get('valor_liquido_estimado')) if nf else '','nf_retencoes_estimadas':nf.get('retencoes',{}).get('total_retencoes','') if nf else '','nf_data':nf.get('data_emissao_ou_primeira_data','') if nf else '','comprovante_beneficiario':comp.get('beneficiario','') if comp else '','comprovante_doc':comp.get('cnpj_cpf','') if comp else '','comprovante_valor':comp.get('valor','') if comp else '','comprovante_valor_formatado':formatar_valor(comp.get('valor')) if comp else '','data_pagamento':comp.get('data_pagamento','') if comp else '','documento_banco':comp.get('documento_banco','') if comp else '','pagina_comprovante':comp.get('pagina','') if comp else '','arquivo_nf':nf.get('arquivo','') if nf else '','arquivo_comprovante':comp.get('arquivo_pagina','') if comp else '','pdf_final':pdf,'texto_nf_resumo':(nf.get('texto','')[:700] if nf and nf.get('texto') else ''),'texto_comprovante_resumo':(comp.get('texto','')[:700] if comp and comp.get('texto') else '')}
 
+
+def limpar_tudo_app(apagar_saida=True):
+    pastas=[DIR_NFS, DIR_COMP, DIR_TMP, DIR_REL]
+    if apagar_saida:
+        pastas.append(DIR_SAIDA)
+    for pasta in pastas:
+        pasta.mkdir(parents=True, exist_ok=True)
+        for item in sorted(pasta.rglob('*'), reverse=True):
+            try:
+                if item.is_file(): item.unlink()
+                elif item.is_dir(): item.rmdir()
+            except Exception:
+                pass
+
 st.title('Conciliador NF x Comprovante')
-st.caption('V1.5.1 - match financeiro: CNPJ opcional, valor bruto/líquido estimado, texto completo e ranking.')
+st.caption('V1.5.2 - match financeiro + botão de limpeza para trocar dia/lote/pasta.')
+st.warning('Use o botão abaixo antes de trocar o dia, lote ou pasta para não misturar arquivos anteriores.')
+col_limpar1, col_limpar2 = st.columns([1, 3])
+with col_limpar1:
+    if st.button('🧹 Limpar tudo / novo dia', type='secondary'):
+        limpar_tudo_app(apagar_saida=True)
+        st.success('Tudo limpo. Agora você pode enviar o novo lote de NFs e comprovantes.')
+        st.stop()
+
 col1,col2=st.columns(2)
 with col1: arquivos_nf=st.file_uploader('Enviar PDFs das NFs', type=['pdf'], accept_multiple_files=True)
 with col2: arquivos_comp=st.file_uploader('Enviar lote(s) de comprovantes', type=['pdf'], accept_multiple_files=True)
@@ -252,8 +274,8 @@ if st.button('Processar conciliação', type='primary'):
     df=limpar_dataframe_excel(pd.DataFrame(registros)); rel=DIR_REL/f"relatorio_conciliacao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     with pd.ExcelWriter(rel, engine='openpyxl') as writer:
         df.to_excel(writer,index=False,sheet_name='Resultado')
-        pd.DataFrame(nfs).drop(columns=['texto','tokens_nome','tokens_texto'], errors='ignore').to_excel(writer,index=False,sheet_name='NFs_lidas')
-        pd.DataFrame(comps).drop(columns=['texto','tokens_nome','tokens_texto'], errors='ignore').to_excel(writer,index=False,sheet_name='Comprovantes_lidos')
+        limpar_dataframe_excel(pd.DataFrame(nfs).drop(columns=['texto','tokens_nome','tokens_texto'], errors='ignore')).to_excel(writer,index=False,sheet_name='NFs_lidas')
+        limpar_dataframe_excel(pd.DataFrame(comps).drop(columns=['texto','tokens_nome','tokens_texto'], errors='ignore')).to_excel(writer,index=False,sheet_name='Comprovantes_lidos')
     st.success('Processamento concluído.')
     m1,m2,m3,m4=st.columns(4); m1.metric('NFs lidas',len(nfs)); m2.metric('Comprovantes lidos',len(comps)); m3.metric('Conciliados',len([r for r in resultados if r['status']=='Conciliado'])); m4.metric('Conferir manualmente',len([r for r in resultados if r['status']=='Conferir manualmente']))
     st.dataframe(df,use_container_width=True)
