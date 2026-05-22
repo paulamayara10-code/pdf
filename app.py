@@ -37,7 +37,11 @@ def limpar_para_excel(valor):
 def limpar_dataframe_excel(df):
     if df is None or df.empty:
         return df
-    return df.applymap(limpar_para_excel)
+    
+    try:
+        return df.map(limpar_para_excel)
+    except AttributeError:
+        return df.applymap(limpar_para_excel)
 
 STOPWORDS={"LTDA","EIRELI","ME","EPP","SA","S/A","SERVICOS","SERVIÇOS","SERVICO","SERVIÇO","ADMINISTRATIVOS","ADMINISTRATIVO","COMERCIO","COMÉRCIO","INDUSTRIA","INDÚSTRIA","REPRESENTACOES","REPRESENTAÇÕES","PRODUTOS","MEDICOS","MÉDICOS","HOSPITALARES","CONSULTORIA","EMPRESARIAL","DE","DA","DO","DAS","DOS","E","EM","PARA","COM"}
 
@@ -319,7 +323,7 @@ def limpar_tudo_app(apagar_saida=True):
                 pass
 
 st.title('Conciliador NF x Comprovante')
-st.caption('V1.5.4 - Excel corrigido + leitura corrigida de PDFs: aceita .PDF/.Pdf, evita sobrescrever nomes duplicados e gera diagnóstico.')
+st.caption('V1.5.5 - Excel corrigido + leitura corrigida de PDFs: aceita .PDF/.Pdf, evita sobrescrever nomes duplicados e gera diagnóstico.')
 st.warning('Use o botão abaixo antes de trocar o dia, lote ou pasta para não misturar arquivos anteriores.')
 col_limpar1, col_limpar2 = st.columns([1, 3])
 with col_limpar1:
