@@ -1,326 +1,543 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
 from datetime import datetime
-import re, zipfile
+import re, zipfile, unicodedata
+from io import BytesIO
+
 import pandas as pd
 import streamlit as st
 import pdfplumber
 from pypdf import PdfReader, PdfWriter
 from rapidfuzz import fuzz
 
+
 st.set_page_config(page_title="Conciliador NF x Comprovante", layout="wide")
 
 BASE_DIR = Path(__file__).parent
-DIR_TEMP = BASE_DIR / "temp_uploads"
-for p in [DIR_TEMP / "nfs", DIR_TEMP / "comprovantes"]:
+DIR_NFS = BASE_DIR / "entrada" / "nfs"
+DIR_COMP = BASE_DIR / "entrada" / "comprovantes"
+DIR_TMP = BASE_DIR / "temporario"
+DIR_REL = BASE_DIR / "relatorios"
+
+for p in [DIR_NFS, DIR_COMP, DIR_TMP, DIR_REL]:
     p.mkdir(parents=True, exist_ok=True)
 
-# -------------------- utilidades --------------------
+
+# =========================
+# NORMALIZAÇÕES
+# =========================
+STOPWORDS = {
+    "LTDA", "EIRELI", "ME", "EPP", "S A", "SA", "S/A", "SERVICOS", "SERVIÇOS",
+    "ADMINISTRATIVOS", "ADMINISTRATIVA", "ADMINISTRATIVO", "COMERCIO", "COMÉRCIO",
+    "INDUSTRIA", "INDÚSTRIA", "REPRESENTACOES", "REPRESENTAÇÕES", "PRODUTOS",
+    "MEDICOS", "MÉDICOS", "HOSPITALARES", "CONSULTORIA", "EMPRESARIAL"
+}
+
+
 def limpar_texto(txt):
     return re.sub(r"\s+", " ", txt or "").strip()
 
-def nums(txt):
+
+def remover_acentos(txt):
+    txt = unicodedata.normalize("NFKD", str(txt or ""))
+    return "".join(c for c in txt if not unicodedata.combining(c))
+
+
+def normalizar_nome(txt):
+    txt = remover_acentos(str(txt or "")).upper()
+    txt = re.sub(r"[^A-Z0-9 ]", " ", txt)
+    partes = [p for p in txt.split() if p not in STOPWORDS and len(p) > 1]
+    return " ".join(partes)
+
+
+def somente_numeros(txt):
     return re.sub(r"\D", "", str(txt or ""))
 
-def valor_float(txt):
-    if txt is None: return None
-    txt = str(txt).replace("R$", "").strip().replace(".", "").replace(",", ".")
-    try: return round(float(txt), 2)
-    except Exception: return None
 
-def moeda(v):
-    if v is None or v == "": return ""
-    try: return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception: return str(v)
+def normalizar_valor(txt):
+    if txt is None:
+        return None
+    txt = str(txt).replace("R$", "").strip()
+    txt = txt.replace(".", "").replace(",", ".")
+    try:
+        return round(float(txt), 2)
+    except Exception:
+        return None
 
-def safe_name(txt):
-    txt = str(txt or "SEM_NOME").upper()
-    txt = re.sub(r"[^A-Z0-9_\- ]", "", txt)
+
+def formatar_valor(v):
+    if v is None or v == "":
+        return ""
+    try:
+        return f"R$ {float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return str(v)
+
+
+def limpar_nome_arquivo(txt):
+    txt = normalizar_nome(txt) or "SEM_NOME"
+    txt = re.sub(r"[^A-Z0-9_ -]", "", txt)
     txt = re.sub(r"\s+", "_", txt).strip("_")
     return txt[:90]
 
-def salvar_uploads(files, pasta):
-    for f in pasta.glob("*"):
-        if f.is_file(): f.unlink()
-    salvos = []
-    for arq in files or []:
-        destino = pasta / arq.name
-        destino.write_bytes(arq.read())
-        salvos.append(destino)
-    return salvos
 
-# -------------------- leitura NF --------------------
-def ler_texto_pdf(path):
+# =========================
+# EXTRAÇÃO DE NFs
+# =========================
+def ler_pdf_texto(caminho):
     texto = ""
-    with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            texto += "\n" + (page.extract_text() or "")
+    with pdfplumber.open(caminho) as pdf:
+        for pag in pdf.pages:
+            texto += "\n" + (pag.extract_text() or "")
     return limpar_texto(texto)
 
-def extrair_nf(path):
-    try: texto = ler_texto_pdf(path)
-    except Exception as e: texto = ""; erro = str(e)
-    else: erro = ""
 
-    cnpjs = re.findall(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", texto)
-    cnpj_prestador = cnpjs[0] if cnpjs else ""
+def extrair_cnpjs(texto):
+    return re.findall(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", texto or "")
 
-    numero = ""
-    for pat in [r"N[uú]mero da Nota\s*(\d+)", r"Nota\s*(\d{4,})", r"RPS Nº\s*(\d+)"]:
-        m = re.search(pat, texto, re.I)
-        if m: numero = m.group(1); break
 
-    fornecedor = ""
-    m = re.search(r"Nome/Raz[aã]o Social:\s*(.*?)\s*Endere[cç]o:", texto, re.I)
-    if m: fornecedor = limpar_texto(m.group(1))
-    if not fornecedor:
-        m = re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\s+[\d\.\-]+\s+(.*?)\s+(?:AV|RUA|AL|ROD|ESTRADA)\s", texto, re.I)
-        if m: fornecedor = limpar_texto(m.group(1))
+def extrair_cpfs(texto):
+    return re.findall(r"\d{3}\.\d{3}\.\d{3}-\d{2}", texto or "")
 
-    valor = None
-    for pat in [r"VALOR TOTAL DO SERVI[ÇC]O\s*=\s*R\$\s*([\d\.\,]+)", r"Valor Total.*?R\$\s*([\d\.\,]+)", r"VALOR.*?R\$\s*([\d\.\,]+)"]:
-        m = re.search(pat, texto, re.I)
-        if m: valor = valor_float(m.group(1)); break
 
-    return {"arquivo": str(path), "numero_nf": numero, "fornecedor": fornecedor, "cnpj": cnpj_prestador, "valor": valor, "texto": texto, "erro": erro}
+def extrair_numero_nf(texto):
+    padroes = [
+        r"N[uú]mero da Nota\s*(\d+)",
+        r"N[ºo°\. ]+\s*(\d{4,})",
+        r"RPS\s*N[ºo°\. ]*\s*(\d+)",
+        r"NFS-e\s*(\d{4,})",
+    ]
+    for p in padroes:
+        m = re.search(p, texto, re.I)
+        if m:
+            return m.group(1).lstrip("0") or m.group(1)
+    return ""
 
-# -------------------- leitura comprovante --------------------
-def salvar_pagina_pdf(pdf_origem, idx, pasta):
+
+def extrair_fornecedor_nf(texto):
+    # Padrão NFS-e SP: Nome/Razão Social antes do endereço
+    ms = re.findall(r"Nome/Raz[aã]o Social:\s*(.*?)\s*Endere[cç]o:", texto, re.I)
+    if ms:
+        return limpar_texto(ms[0])
+
+    cnpjs = extrair_cnpjs(texto)
+    if cnpjs:
+        pos = texto.find(cnpjs[0])
+        trecho = texto[pos:pos+250]
+        m = re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\s+[\d\.\-]*\s*(.*?)\s+(?:AV|RUA|AL|TRAV|ESTR|ROD)\s", trecho, re.I)
+        if m:
+            return limpar_texto(m.group(1))
+
+    return ""
+
+
+def extrair_valor_nf(texto):
+    padroes = [
+        r"VALOR TOTAL DO SERVI[ÇC]O\s*=\s*R\$\s*([\d\.\,]+)",
+        r"Valor Total da Nota\s*R?\$?\s*([\d\.\,]+)",
+        r"Valor Total.*?R\$\s*([\d\.\,]+)",
+        r"TOTAL\s*R\$\s*([\d\.\,]+)",
+    ]
+    for p in padroes:
+        m = re.search(p, texto, re.I)
+        if m:
+            return normalizar_valor(m.group(1))
+    return None
+
+
+def ler_nf(caminho):
+    texto = ler_pdf_texto(caminho)
+    cnpjs = extrair_cnpjs(texto)
+    return {
+        "arquivo": str(caminho),
+        "texto": texto,
+        "numero_nf": extrair_numero_nf(texto),
+        "fornecedor": extrair_fornecedor_nf(texto),
+        "fornecedor_norm": normalizar_nome(extrair_fornecedor_nf(texto)),
+        "cnpj": cnpjs[0] if cnpjs else "",
+        "valor": extrair_valor_nf(texto),
+        "tokens_nome": set(normalizar_nome(extrair_fornecedor_nf(texto)).split()),
+    }
+
+
+# =========================
+# EXTRAÇÃO COMPROVANTES
+# =========================
+def salvar_pagina_pdf(pdf_origem, i, pasta):
     pasta.mkdir(parents=True, exist_ok=True)
-    reader, writer = PdfReader(str(pdf_origem)), PdfWriter()
-    writer.add_page(reader.pages[idx])
-    out = pasta / f"{Path(pdf_origem).stem}_pagina_{idx+1:03d}.pdf"
-    with open(out, "wb") as f: writer.write(f)
-    return str(out)
+    reader = PdfReader(str(pdf_origem))
+    writer = PdfWriter()
+    writer.add_page(reader.pages[i])
+    saida = pasta / f"{Path(pdf_origem).stem}_pagina_{i+1:03d}.pdf"
+    with open(saida, "wb") as f:
+        writer.write(f)
+    return str(saida)
 
-def extrair_comprovantes(path, pasta_paginas):
+
+def extrair_valor_comp(texto):
+    padroes = [
+        r"VALOR COBRADO\s*([\d\.\,]+)",
+        r"VALOR DO DOCUMENTO\s*([\d\.\,]+)",
+        r"VALOR:\s*R?\$?\s*([\d\.\,]+)",
+        r"VALOR\s*([\d\.\,]+)",
+    ]
+    for p in padroes:
+        m = re.search(p, texto, re.I)
+        if m:
+            return normalizar_valor(m.group(1))
+    return None
+
+
+def extrair_beneficiario(texto):
+    padroes = [
+        r"PAGO PARA:\s*(.*?)\s*(?:CNPJ|CPF|CHAVE PIX|INSTITUICAO|INSTITUIÇÃO)",
+        r"BENEFICIARIO:\s*(.*?)\s*(?:CPF/CNPJ|CNPJ|NOME FANTASIA|BANCO|BENEFICIARIO FINAL)",
+        r"BENEFICIÁRIO:\s*(.*?)\s*(?:CPF/CNPJ|CNPJ|NOME FANTASIA|BANCO|BENEFICIÁRIO FINAL)",
+    ]
+    for p in padroes:
+        m = re.search(p, texto, re.I)
+        if m:
+            return limpar_texto(m.group(1))
+    return ""
+
+
+def extrair_doc_comp(texto):
+    docs = extrair_cnpjs(texto) + extrair_cpfs(texto)
+    docs_filtrados = []
+    for d in docs:
+        dn = somente_numeros(d)
+        if dn not in {"02629588000172", "002629588000172"}:
+            docs_filtrados.append(d)
+    return docs_filtrados[0] if docs_filtrados else ""
+
+
+def extrair_data_comp(texto):
+    padroes = [
+        r"DATA DO PAGAMENTO\s*(\d{2}/\d{2}/\d{4})",
+        r"DATA DA TRANSFERENCIA:\s*(\d{2}/\d{2}/\d{4})",
+        r"DATA:\s*(\d{2}/\d{2}/\d{4})",
+    ]
+    for p in padroes:
+        m = re.search(p, texto, re.I)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def extrair_documento_banco(texto):
+    m = re.search(r"NR\.?\s*DOCUMENTO[: ]+\s*([\d\.]+)", texto, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"DOCUMENTO:\s*([\d\.]+)", texto, re.I)
+    return m.group(1) if m else ""
+
+
+def ler_comprovantes(caminho_pdf):
     comps = []
-    with pdfplumber.open(path) as pdf:
-        for i, page in enumerate(pdf.pages):
-            texto = limpar_texto(page.extract_text() or "")
-            arq_pag = salvar_pagina_pdf(path, i, pasta_paginas)
-
-            valor = None
-            for pat in [r"VALOR COBRADO\s*([\d\.\,]+)", r"VALOR DO DOCUMENTO\s*([\d\.\,]+)", r"VALOR:\s*R?\$?\s*([\d\.\,]+)", r"VALOR\s*([\d\.\,]+)"]:
-                m = re.search(pat, texto, re.I)
-                if m: valor = valor_float(m.group(1)); break
-
-            beneficiario = ""
-            for pat in [r"PAGO PARA:\s*(.*?)\s*(?:CNPJ|CPF|CHAVE PIX|INSTITUICAO)", r"BENEFICIARIO:\s*(.*?)\s*(?:CPF/CNPJ|CNPJ|NOME FANTASIA|BANCO)", r"BENEFICIÁRIO:\s*(.*?)\s*(?:CPF/CNPJ|CNPJ|NOME FANTASIA|BANCO)"]:
-                m = re.search(pat, texto, re.I)
-                if m: beneficiario = limpar_texto(m.group(1)); break
-
-            cands = []
-            for pat in [r"CNPJ:\s*([\d\.\*/-]+)", r"CPF/CNPJ:\s*([\d\.\*/-]+)", r"CPF:\s*([\d\.\*/-]+)"]:
-                cands += re.findall(pat, texto, re.I)
-            cands = [c for c in cands if "02.629" not in c and "2.629" not in c and "002." not in c]
-            cnpj = cands[0] if cands else ""
-
-            data = ""
-            for pat in [r"DATA DO PAGAMENTO\s*(\d{2}/\d{2}/\d{4})", r"DATA DA TRANSFERENCIA:\s*(\d{2}/\d{2}/\d{4})", r"DATA:\s*(\d{2}/\d{2}/\d{4})"]:
-                m = re.search(pat, texto, re.I)
-                if m: data = m.group(1); break
-
-            comps.append({"arquivo_lote": str(path), "arquivo_pagina": arq_pag, "pagina": i+1, "beneficiario": beneficiario, "cnpj": cnpj, "valor": valor, "data_pagamento": data, "texto": texto})
+    pasta_paginas = DIR_TMP / "paginas_comprovantes"
+    with pdfplumber.open(caminho_pdf) as pdf:
+        for i, pag in enumerate(pdf.pages):
+            texto = limpar_texto(pag.extract_text() or "")
+            arq = salvar_pagina_pdf(caminho_pdf, i, pasta_paginas)
+            benef = extrair_beneficiario(texto)
+            comps.append({
+                "arquivo_lote": str(caminho_pdf),
+                "arquivo_pagina": arq,
+                "pagina": i + 1,
+                "texto": texto,
+                "beneficiario": benef,
+                "beneficiario_norm": normalizar_nome(benef),
+                "tokens_nome": set(normalizar_nome(benef).split()),
+                "cnpj_cpf": extrair_doc_comp(texto),
+                "valor": extrair_valor_comp(texto),
+                "data_pagamento": extrair_data_comp(texto),
+                "documento_banco": extrair_documento_banco(texto),
+            })
     return comps
 
-# -------------------- score melhorado --------------------
+
+# =========================
+# SCORE EXPANDIDO
+# =========================
 def score_match(nf, comp):
-    score = 0
+    pontos = 0
     motivos = []
-    nf_cnpj, comp_cnpj = nums(nf.get("cnpj")), nums(comp.get("cnpj"))
 
-    # CNPJ completo ou parcialmente mascarado
-    if nf_cnpj and comp_cnpj:
-        if nf_cnpj == comp_cnpj:
-            score += 45; motivos.append("CNPJ igual")
-        elif len(comp_cnpj) >= 5 and (comp_cnpj[:3] == nf_cnpj[:3] or comp_cnpj[-2:] == nf_cnpj[-2:]):
-            score += 18; motivos.append("CNPJ parcial/mascarado compatível")
+    nf_doc = somente_numeros(nf.get("cnpj"))
+    comp_doc = somente_numeros(comp.get("cnpj_cpf"))
 
-    # Valor é o principal quando comprovante está com CNPJ mascarado
-    if nf.get("valor") is not None and comp.get("valor") is not None:
-        diff = abs(float(nf["valor"]) - float(comp["valor"]))
+    # 1. Documento completo/parcial
+    if nf_doc and comp_doc:
+        if nf_doc == comp_doc:
+            pontos += 40
+            motivos.append("CNPJ/CPF igual")
+        elif len(comp_doc) >= 6 and comp_doc[:3] == nf_doc[:3] and comp_doc[-2:] == nf_doc[-2:]:
+            pontos += 18
+            motivos.append("CNPJ parcialmente compatível")
+
+    # 2. Valor exato ou próximo
+    nv, cv = nf.get("valor"), comp.get("valor")
+    if nv is not None and cv is not None:
+        diff = abs(float(nv) - float(cv))
         if diff <= 0.01:
-            score += 40; motivos.append("Valor igual")
-        elif diff <= 1:
-            score += 30; motivos.append("Valor próximo")
-        elif diff <= 10:
-            score += 15; motivos.append("Valor com pequena diferença")
+            pontos += 35
+            motivos.append("Valor igual")
+        elif diff <= 1.00:
+            pontos += 25
+            motivos.append("Valor com diferença até R$ 1")
+        elif nv and diff / float(nv) <= 0.02:
+            pontos += 12
+            motivos.append("Valor próximo até 2%")
 
-    nome_score = fuzz.token_set_ratio(str(nf.get("fornecedor") or "").upper(), str(comp.get("beneficiario") or "").upper())
-    if nome_score >= 90:
-        score += 25; motivos.append("Nome muito parecido")
-    elif nome_score >= 75:
-        score += 18; motivos.append("Nome parecido")
-    elif nome_score >= 58:
-        score += 10; motivos.append("Nome parcialmente parecido")
+    # 3. Similaridade nome completa
+    nome_nf = nf.get("fornecedor_norm", "")
+    nome_cp = comp.get("beneficiario_norm", "")
+    sim = fuzz.token_set_ratio(nome_nf, nome_cp)
+    if sim >= 90:
+        pontos += 25
+        motivos.append(f"Nome muito parecido ({sim:.0f}%)")
+    elif sim >= 80:
+        pontos += 18
+        motivos.append(f"Nome parecido ({sim:.0f}%)")
+    elif sim >= 65:
+        pontos += 10
+        motivos.append(f"Nome parcialmente parecido ({sim:.0f}%)")
 
-    # Busca tokens relevantes do fornecedor no texto inteiro do comprovante
-    forn_tokens = [t for t in re.findall(r"[A-Z0-9]{4,}", str(nf.get("fornecedor") or "").upper()) if t not in {"LTDA", "SERVICOS", "ADMINISTRATIVOS", "ME", "EPP"}]
-    texto_comp = str(comp.get("texto") or "").upper()
-    hits = sum(1 for t in forn_tokens if t in texto_comp)
-    if hits >= 2:
-        score += 8; motivos.append("Tokens do fornecedor no comprovante")
+    # 4. Tokens importantes em comum
+    comuns = nf.get("tokens_nome", set()) & comp.get("tokens_nome", set())
+    tokens_relevantes = [t for t in comuns if len(t) >= 4]
+    if len(tokens_relevantes) >= 2:
+        pontos += 10
+        motivos.append("Duas ou mais palavras-chave em comum")
+    elif len(tokens_relevantes) == 1:
+        pontos += 5
+        motivos.append("Uma palavra-chave em comum")
 
-    return min(score, 100), "; ".join(motivos), nome_score
+    # 5. Número NF/RPS/documento dentro do texto do comprovante
+    num_nf = somente_numeros(nf.get("numero_nf"))
+    texto_comp = somente_numeros(comp.get("texto"))
+    if num_nf and len(num_nf) >= 2 and num_nf in texto_comp:
+        pontos += 10
+        motivos.append("Número da NF/RPS localizado no comprovante")
 
-def criar_ranking(nfs, comps):
-    linhas = []
-    for i, nf in enumerate(nfs):
-        for j, comp in enumerate(comps):
-            sc, motivos, nome_score = score_match(nf, comp)
-            linhas.append({"nf_idx": i, "comp_idx": j, "score": sc, "motivos": motivos, "nome_score": nome_score})
-    return pd.DataFrame(linhas).sort_values(["nf_idx", "score"], ascending=[True, False])
+    return min(pontos, 100), " | ".join(motivos), sim
 
-def conciliar_auto(nfs, comps, limite):
-    ranking = criar_ranking(nfs, comps)
-    usados = set(); saida = []
-    for i, nf in enumerate(nfs):
-        cand = ranking[(ranking.nf_idx == i) & (~ranking.comp_idx.isin(usados))].head(1)
-        if cand.empty:
-            saida.append({"status":"NF sem comprovante", "score":0, "motivos":"", "nf":nf, "comprovante":None, "comp_idx":None})
-            continue
-        row = cand.iloc[0]
-        comp = comps[int(row.comp_idx)]
-        status = "Conciliado" if row.score >= limite else ("Conferir manualmente" if row.score >= 45 else "NF sem comprovante")
-        if status == "Conciliado": usados.add(int(row.comp_idx))
-        saida.append({"status":status, "score":int(row.score), "motivos":row.motivos, "nf":nf, "comprovante":comp, "comp_idx":int(row.comp_idx)})
-    return saida, ranking, usados
 
-# -------------------- geração arquivos --------------------
-def juntar_pdfs(nf_arq, comp_arq, pasta_saida, nf):
+def conciliar(nfs, comps, limite_auto, limite_manual):
+    resultados = []
+    usados = set()
+
+    for nf in nfs:
+        candidatos = []
+        for comp in comps:
+            if comp["arquivo_pagina"] in usados:
+                continue
+            sc, motivos, sim = score_match(nf, comp)
+            candidatos.append((sc, motivos, sim, comp))
+
+        candidatos.sort(key=lambda x: x[0], reverse=True)
+        melhor = candidatos[0] if candidatos else (0, "", 0, None)
+        sc, motivos, sim, comp = melhor
+
+        if comp and sc >= limite_auto:
+            status = "Conciliado"
+            usados.add(comp["arquivo_pagina"])
+        elif comp and sc >= limite_manual:
+            status = "Conferir manualmente"
+        else:
+            status = "NF sem comprovante"
+
+        resultados.append({
+            "status": status,
+            "score": sc,
+            "motivos": motivos,
+            "similaridade_nome": round(sim, 2),
+            "nf": nf,
+            "comprovante": comp,
+            "top_candidatos": candidatos[:5],
+        })
+
+    return resultados, usados
+
+
+def unir_pdfs(nf, comp, pasta_saida):
+    pasta_saida = Path(pasta_saida)
     pasta_saida.mkdir(parents=True, exist_ok=True)
-    nome = f"NF_{safe_name(nf.get('numero_nf'))}_{safe_name(nf.get('fornecedor'))}.pdf"
-    out = pasta_saida / nome
+    nome = f"NF_{limpar_nome_arquivo(nf.get('numero_nf'))}_{limpar_nome_arquivo(nf.get('fornecedor'))}.pdf"
+    caminho = pasta_saida / nome
+
     writer = PdfWriter()
-    for arq in [nf_arq, comp_arq]:
+    for arq in [nf["arquivo"], comp["arquivo_pagina"]]:
         reader = PdfReader(str(arq))
-        for page in reader.pages: writer.add_page(page)
-    with open(out, "wb") as f: writer.write(f)
-    return str(out)
+        for page in reader.pages:
+            writer.add_page(page)
 
-def zipar_pasta(pasta, destino):
-    with zipfile.ZipFile(destino, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in pasta.rglob("*"):
-            if f.is_file(): z.write(f, f.relative_to(pasta))
-    return destino
+    with open(caminho, "wb") as f:
+        writer.write(f)
 
-# -------------------- UI --------------------
-st.title("Conciliador de NF x Comprovante")
-st.caption("V1.2 - associação melhorada + pasta de saída + escolha manual")
+    return str(caminho)
 
-with st.expander("Configurações de saída", expanded=True):
-    pasta_saida_nome = st.text_input("Nome ou caminho da pasta para salvar os PDFs", value="saida_conciliacao")
-    st.info("No Streamlit Cloud, a pasta é criada dentro do ambiente do app. Para salvar no seu computador, baixe o ZIP ao final.")
 
-col1, col2, col3 = st.columns([1,1,0.7])
+def zipar_pasta(pasta):
+    mem = BytesIO()
+    pasta = Path(pasta)
+    with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as z:
+        for arq in pasta.rglob("*"):
+            if arq.is_file():
+                z.write(arq, arq.relative_to(pasta))
+    mem.seek(0)
+    return mem
+
+
+# =========================
+# INTERFACE
+# =========================
+st.title("Conciliador NF x Comprovante")
+st.caption("V1.3 - match expandido por nome, valor, CNPJ, palavras-chave, NF/RPS e ranking de candidatos.")
+
+col1, col2 = st.columns(2)
 with col1:
-    nfs_up = st.file_uploader("PDFs das NFs", type=["pdf"], accept_multiple_files=True)
+    arquivos_nf = st.file_uploader("Enviar PDFs das NFs", type=["pdf"], accept_multiple_files=True)
 with col2:
-    comps_up = st.file_uploader("PDF/lote de comprovantes", type=["pdf"], accept_multiple_files=True)
-with col3:
-    limite = st.slider("Score automático", 0, 100, 70)
+    arquivos_comp = st.file_uploader("Enviar lote(s) de comprovantes", type=["pdf"], accept_multiple_files=True)
 
-processar = st.button("Processar", type="primary")
+with st.expander("Configurações avançadas", expanded=True):
+    c1, c2, c3 = st.columns(3)
+    limite_auto = c1.slider("Score para conciliar automático", 0, 100, 72)
+    limite_manual = c2.slider("Score para enviar à conferência", 0, 100, 45)
+    pasta_saida_txt = c3.text_input(
+        "Pasta de saída dos PDFs unidos",
+        value=str(BASE_DIR / "saida" / "conciliados")
+    )
 
-if processar:
-    if not nfs_up or not comps_up:
-        st.error("Envie as NFs e o lote de comprovantes.")
+if st.button("Processar conciliação", type="primary"):
+    for pasta in [DIR_NFS, DIR_COMP, DIR_TMP]:
+        if pasta.exists():
+            for arq in pasta.rglob("*"):
+                if arq.is_file():
+                    arq.unlink()
+        pasta.mkdir(parents=True, exist_ok=True)
+
+    if not arquivos_nf or not arquivos_comp:
+        st.error("Envie pelo menos uma NF e um lote de comprovantes.")
         st.stop()
 
-    pasta_saida = Path(pasta_saida_nome)
-    if not pasta_saida.is_absolute(): pasta_saida = BASE_DIR / pasta_saida_nome
-    pastas = {
-        "base": pasta_saida,
-        "conciliados": pasta_saida / "conciliados",
-        "manual": pasta_saida / "conferir_manual",
-        "sem_nf": pasta_saida / "comprovantes_sem_nf",
-        "rel": pasta_saida / "relatorios",
-    }
-    for p in pastas.values(): p.mkdir(parents=True, exist_ok=True)
-
-    nf_paths = salvar_uploads(nfs_up, DIR_TEMP / "nfs")
-    comp_paths = salvar_uploads(comps_up, DIR_TEMP / "comprovantes")
+    for arq in arquivos_nf:
+        (DIR_NFS / arq.name).write_bytes(arq.read())
+    for arq in arquivos_comp:
+        (DIR_COMP / arq.name).write_bytes(arq.read())
 
     with st.spinner("Lendo NFs..."):
-        nfs = [extrair_nf(p) for p in nf_paths]
+        nfs = [ler_nf(p) for p in DIR_NFS.glob("*.pdf")]
+
     with st.spinner("Lendo e separando comprovantes..."):
         comps = []
-        for p in comp_paths: comps.extend(extrair_comprovantes(p, pastas["sem_nf"]))
-    with st.spinner("Associando..."):
-        resultado, ranking, usados_auto = conciliar_auto(nfs, comps, limite)
+        for p in DIR_COMP.glob("*.pdf"):
+            comps.extend(ler_comprovantes(p))
 
-    # Permite seleção manual para itens não conciliados
-    st.session_state["resultado"] = resultado
-    st.session_state["nfs"] = nfs
-    st.session_state["comps"] = comps
-    st.session_state["ranking"] = ranking
-    st.session_state["pasta_saida"] = str(pasta_saida)
+    with st.spinner("Calculando associação expandida..."):
+        resultados, usados = conciliar(nfs, comps, limite_auto, limite_manual)
 
-if "resultado" in st.session_state:
-    nfs = st.session_state["nfs"]; comps = st.session_state["comps"]
-    resultado = st.session_state["resultado"]; ranking = st.session_state["ranking"]
-    pasta_saida = Path(st.session_state["pasta_saida"])
+    registros = []
+    pasta_saida = Path(pasta_saida_txt)
+    pasta_saida.mkdir(parents=True, exist_ok=True)
 
-    st.subheader("Resumo")
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("NFs lidas", len(nfs)); c2.metric("Comprovantes lidos", len(comps))
-    c3.metric("Conciliados automáticos", sum(1 for r in resultado if r["status"] == "Conciliado"))
-    c4.metric("Para conferir", sum(1 for r in resultado if r["status"] != "Conciliado"))
+    for r in resultados:
+        nf, comp = r["nf"], r["comprovante"]
+        pdf_final = ""
 
-    st.subheader("Conferência e escolha manual")
-    selecoes = {}
-    usados_escolhidos = set(r["comp_idx"] for r in resultado if r["status"] == "Conciliado" and r["comp_idx"] is not None)
+        if r["status"] == "Conciliado" and comp:
+            pdf_final = unir_pdfs(nf, comp, pasta_saida)
 
-    for idx, r in enumerate(resultado):
-        nf = r["nf"]
-        with st.expander(f"NF {nf.get('numero_nf') or idx+1} - {nf.get('fornecedor')} - {moeda(nf.get('valor'))} | {r['status']} | Score {r['score']}", expanded=(r["status"] != "Conciliado")):
-            st.write(f"**CNPJ NF:** {nf.get('cnpj')} | **Valor:** {moeda(nf.get('valor'))}")
-            top = ranking[ranking.nf_idx == idx].head(8)
-            opcoes = ["Manter automático / sem alteração", "Sem comprovante"]
-            mapa = {}
-            for _, row in top.iterrows():
-                comp = comps[int(row.comp_idx)]
-                label = f"Score {int(row.score)} | pág {comp['pagina']} | {comp.get('beneficiario')} | {moeda(comp.get('valor'))} | {comp.get('data_pagamento')} | {row.motivos}"
-                opcoes.append(label); mapa[label] = int(row.comp_idx)
-            escolha = st.selectbox("Escolher comprovante", opcoes, key=f"sel_{idx}")
-            if escolha in mapa: selecoes[idx] = mapa[escolha]
-            elif escolha == "Sem comprovante": selecoes[idx] = None
+        registros.append({
+            "status": r["status"],
+            "score": r["score"],
+            "motivos_match": r["motivos"],
+            "similaridade_nome": r["similaridade_nome"],
+            "nf_numero": nf.get("numero_nf", ""),
+            "nf_fornecedor": nf.get("fornecedor", ""),
+            "nf_cnpj": nf.get("cnpj", ""),
+            "nf_valor": nf.get("valor", ""),
+            "nf_valor_formatado": formatar_valor(nf.get("valor")),
+            "comprovante_beneficiario": comp.get("beneficiario", "") if comp else "",
+            "comprovante_doc": comp.get("cnpj_cpf", "") if comp else "",
+            "comprovante_valor": comp.get("valor", "") if comp else "",
+            "comprovante_valor_formatado": formatar_valor(comp.get("valor")) if comp else "",
+            "data_pagamento": comp.get("data_pagamento", "") if comp else "",
+            "pagina_comprovante": comp.get("pagina", "") if comp else "",
+            "arquivo_nf": nf.get("arquivo", ""),
+            "arquivo_comprovante": comp.get("arquivo_pagina", "") if comp else "",
+            "pdf_final": pdf_final,
+        })
 
-    if st.button("Gerar PDFs finais e relatório", type="primary"):
-        conciliados_dir = pasta_saida / "conciliados"
-        rel_dir = pasta_saida / "relatorios"
-        conciliados_dir.mkdir(parents=True, exist_ok=True); rel_dir.mkdir(parents=True, exist_ok=True)
-        registros = []; usados = set()
-
-        for idx, r in enumerate(resultado):
-            nf = r["nf"]
-            comp_idx = selecoes.get(idx, r.get("comp_idx") if r["status"] == "Conciliado" else None)
-            comp = comps[comp_idx] if comp_idx is not None else None
-            pdf_final = ""; status = "NF sem comprovante"; score = r.get("score", 0)
-            if comp:
-                pdf_final = juntar_pdfs(nf["arquivo"], comp["arquivo_pagina"], conciliados_dir, nf)
-                status = "Conciliado manual" if idx in selecoes else "Conciliado"
-                usados.add(comp_idx)
+        # Top 5 candidatos para auditoria
+        for pos, cand in enumerate(r["top_candidatos"], start=1):
+            sc, motivos, sim, c = cand
             registros.append({
-                "status": status, "score": score, "motivos": r.get("motivos", ""),
-                "nf_numero": nf.get("numero_nf", ""), "nf_fornecedor": nf.get("fornecedor", ""), "nf_cnpj": nf.get("cnpj", ""), "nf_valor": nf.get("valor", ""), "arquivo_nf": nf.get("arquivo", ""),
-                "comprovante_beneficiario": comp.get("beneficiario", "") if comp else "", "comprovante_cnpj": comp.get("cnpj", "") if comp else "", "comprovante_valor": comp.get("valor", "") if comp else "", "data_pagamento": comp.get("data_pagamento", "") if comp else "", "arquivo_comprovante": comp.get("arquivo_pagina", "") if comp else "",
-                "pdf_final": pdf_final
+                "status": f"Candidato {pos}",
+                "score": sc,
+                "motivos_match": motivos,
+                "similaridade_nome": round(sim, 2),
+                "nf_numero": nf.get("numero_nf", ""),
+                "nf_fornecedor": nf.get("fornecedor", ""),
+                "nf_cnpj": nf.get("cnpj", ""),
+                "nf_valor": nf.get("valor", ""),
+                "nf_valor_formatado": formatar_valor(nf.get("valor")),
+                "comprovante_beneficiario": c.get("beneficiario", ""),
+                "comprovante_doc": c.get("cnpj_cpf", ""),
+                "comprovante_valor": c.get("valor", ""),
+                "comprovante_valor_formatado": formatar_valor(c.get("valor")),
+                "data_pagamento": c.get("data_pagamento", ""),
+                "pagina_comprovante": c.get("pagina", ""),
+                "arquivo_nf": nf.get("arquivo", ""),
+                "arquivo_comprovante": c.get("arquivo_pagina", ""),
+                "pdf_final": "",
             })
-        for j, comp in enumerate(comps):
-            if j not in usados:
-                registros.append({"status":"Comprovante sem NF", "score":"", "motivos":"", "nf_numero":"", "nf_fornecedor":"", "nf_cnpj":"", "nf_valor":"", "arquivo_nf":"", "comprovante_beneficiario":comp.get("beneficiario", ""), "comprovante_cnpj":comp.get("cnpj", ""), "comprovante_valor":comp.get("valor", ""), "data_pagamento":comp.get("data_pagamento", ""), "arquivo_comprovante":comp.get("arquivo_pagina", ""), "pdf_final":""})
 
-        df = pd.DataFrame(registros)
-        rel = rel_dir / f"relatorio_conciliacao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        df.to_excel(rel, index=False)
-        zip_path = pasta_saida / f"resultado_conciliacao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-        zipar_pasta(pasta_saida, zip_path)
+    for c in comps:
+        if c["arquivo_pagina"] not in usados:
+            registros.append({
+                "status": "Comprovante sem NF automática",
+                "score": "",
+                "motivos_match": "",
+                "similaridade_nome": "",
+                "nf_numero": "",
+                "nf_fornecedor": "",
+                "nf_cnpj": "",
+                "nf_valor": "",
+                "nf_valor_formatado": "",
+                "comprovante_beneficiario": c.get("beneficiario", ""),
+                "comprovante_doc": c.get("cnpj_cpf", ""),
+                "comprovante_valor": c.get("valor", ""),
+                "comprovante_valor_formatado": formatar_valor(c.get("valor")),
+                "data_pagamento": c.get("data_pagamento", ""),
+                "pagina_comprovante": c.get("pagina", ""),
+                "arquivo_nf": "",
+                "arquivo_comprovante": c.get("arquivo_pagina", ""),
+                "pdf_final": "",
+            })
 
-        st.success(f"Arquivos gerados em: {pasta_saida}")
-        st.dataframe(df, use_container_width=True)
-        with open(rel, "rb") as f:
-            st.download_button("Baixar relatório Excel", f, file_name=rel.name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        with open(zip_path, "rb") as f:
-            st.download_button("Baixar todos os PDFs e relatório em ZIP", f, file_name=zip_path.name, mime="application/zip")
+    df = pd.DataFrame(registros)
+    rel = DIR_REL / f"relatorio_conciliacao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    with pd.ExcelWriter(rel, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Resultado")
+
+    st.success("Processamento concluído.")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("NFs lidas", len(nfs))
+    m2.metric("Comprovantes lidos", len(comps))
+    m3.metric("Conciliados", len([r for r in resultados if r["status"] == "Conciliado"]))
+    m4.metric("Conferir manualmente", len([r for r in resultados if r["status"] == "Conferir manualmente"]))
+
+    st.dataframe(df, use_container_width=True)
+
+    with open(rel, "rb") as f:
+        st.download_button("Baixar relatório Excel", f, file_name=rel.name)
+
+    zip_saida = zipar_pasta(pasta_saida)
+    st.download_button(
+        "Baixar PDFs conciliados em ZIP",
+        data=zip_saida,
+        file_name="pdfs_conciliados.zip",
+        mime="application/zip"
+    )
