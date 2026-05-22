@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from pathlib import Path
 from datetime import datetime
-import re, zipfile, unicodedata
+import re, zipfile, unicodedata, shutil
 from io import BytesIO
 import pandas as pd
 import streamlit as st
@@ -13,6 +13,32 @@ st.set_page_config(page_title="Conciliador NF x Comprovante", layout="wide")
 BASE_DIR=Path(__file__).parent
 DIR_NFS=BASE_DIR/'entrada'/'nfs'; DIR_COMP=BASE_DIR/'entrada'/'comprovantes'; DIR_TMP=BASE_DIR/'temporario'; DIR_REL=BASE_DIR/'relatorios'; DIR_SAIDA=BASE_DIR/'saida'/'conciliados'
 for p in [DIR_NFS,DIR_COMP,DIR_TMP,DIR_REL,DIR_SAIDA]: p.mkdir(parents=True, exist_ok=True)
+
+
+def limpar_para_excel(valor):
+    """
+    Limpa qualquer valor antes de gravar no Excel.
+    Remove caracteres que o openpyxl/Excel não aceitam, inclusive controles,
+    noncharacters como U+FFFE/U+FFFF e objetos complexos como dict/set/list.
+    """
+    if isinstance(valor, (dict, list, set, tuple)):
+        valor = str(valor)
+
+    if isinstance(valor, str):
+        # caracteres ilegais para XML/Excel
+        valor = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\uFFFE\uFFFF]", "", valor)
+        # remove surrogates e outros caracteres de controle invisíveis
+        valor = "".join(ch for ch in valor if not (0xD800 <= ord(ch) <= 0xDFFF))
+        return valor[:32000]
+
+    return valor
+
+
+def limpar_dataframe_excel(df):
+    if df is None or df.empty:
+        return df
+    return df.applymap(limpar_para_excel)
+
 STOPWORDS={"LTDA","EIRELI","ME","EPP","SA","S/A","SERVICOS","SERVIÇOS","SERVICO","SERVIÇO","ADMINISTRATIVOS","ADMINISTRATIVO","COMERCIO","COMÉRCIO","INDUSTRIA","INDÚSTRIA","REPRESENTACOES","REPRESENTAÇÕES","PRODUTOS","MEDICOS","MÉDICOS","HOSPITALARES","CONSULTORIA","EMPRESARIAL","DE","DA","DO","DAS","DOS","E","EM","PARA","COM"}
 
 def limpar_texto(t): return re.sub(r"\s+"," ",t or "").strip()
@@ -189,7 +215,7 @@ def conciliar(nfs,comps,lim_auto,lim_manual):
     return res,usados
 
 def unir_pdfs(nf,comp,pasta):
-    pasta=Path(pasta); pasta.mkdir(parents=True, exist_ok=True); caminho=pasta/f"NF_{limpar_nome_arquivo(nf.get('numero_nf'))}_{limpar_nome_arquivo(nf.get('fornecedor'))}.pdf"; writer=PdfWriter()
+    pasta=Path(pasta); pasta.mkdir(parents=True, exist_ok=True); valor_nome=str(nf.get('valor_bruto') or '').replace('.', '_'); caminho=pasta/f"{limpar_nome_arquivo(nf.get('fornecedor'))}_NF_{limpar_nome_arquivo(nf.get('numero_nf'))}_{valor_nome}.pdf"; writer=PdfWriter()
     for arq in [nf['arquivo'], comp['arquivo_pagina']]:
         reader=PdfReader(str(arq))
         for page in reader.pages: writer.add_page(page)
@@ -204,8 +230,104 @@ def zipar_pasta(pasta):
 def linha(status,score,mot,simn,simt,nf,comp,pdf='',tipo='Resultado',empate=False):
     return {'tipo_linha':tipo,'status':status,'score':score,'empate_proximo':'Sim' if empate else 'Não','motivos_match':mot,'similaridade_nome':simn,'similaridade_texto':simt,'nf_numero':nf.get('numero_nf','') if nf else '','nf_fornecedor':nf.get('fornecedor','') if nf else '','nf_cnpj':nf.get('cnpj','') if nf else '','nf_valor_bruto':nf.get('valor_bruto','') if nf else '','nf_valor_bruto_formatado':formatar_valor(nf.get('valor_bruto')) if nf else '','nf_valor_liquido_estimado':nf.get('valor_liquido_estimado','') if nf else '','nf_valor_liquido_formatado':formatar_valor(nf.get('valor_liquido_estimado')) if nf else '','nf_retencoes_estimadas':nf.get('retencoes',{}).get('total_retencoes','') if nf else '','nf_data':nf.get('data_emissao_ou_primeira_data','') if nf else '','comprovante_beneficiario':comp.get('beneficiario','') if comp else '','comprovante_doc':comp.get('cnpj_cpf','') if comp else '','comprovante_valor':comp.get('valor','') if comp else '','comprovante_valor_formatado':formatar_valor(comp.get('valor')) if comp else '','data_pagamento':comp.get('data_pagamento','') if comp else '','documento_banco':comp.get('documento_banco','') if comp else '','pagina_comprovante':comp.get('pagina','') if comp else '','arquivo_nf':nf.get('arquivo','') if nf else '','arquivo_comprovante':comp.get('arquivo_pagina','') if comp else '','pdf_final':pdf,'texto_nf_resumo':(nf.get('texto','')[:700] if nf and nf.get('texto') else ''),'texto_comprovante_resumo':(comp.get('texto','')[:700] if comp and comp.get('texto') else '')}
 
+
+
+def listar_pdfs(pasta):
+    """Lista PDFs independentemente de .pdf, .PDF, .Pdf etc."""
+    pasta = Path(pasta)
+    return sorted([p for p in pasta.iterdir() if p.is_file() and p.suffix.lower() == '.pdf'])
+
+
+def salvar_uploads_unicos(arquivos, pasta_destino, tipo):
+    """
+    Salva uploads sem sobrescrever arquivos com o mesmo nome.
+    Retorna log para auditoria.
+    """
+    pasta_destino = Path(pasta_destino)
+    pasta_destino.mkdir(parents=True, exist_ok=True)
+    logs = []
+    usados = set()
+
+    for idx, arq in enumerate(arquivos or [], start=1):
+        nome_original = arq.name or f'{tipo}_{idx}.pdf'
+        sufixo = Path(nome_original).suffix or '.pdf'
+        base_nome = Path(nome_original).stem.strip() or f'{tipo}_{idx}'
+
+        if sufixo.lower() != '.pdf':
+            logs.append({
+                'tipo': tipo,
+                'arquivo_original': nome_original,
+                'arquivo_salvo': '',
+                'status': 'Ignorado',
+                'motivo': 'Extensão diferente de PDF'
+            })
+            continue
+
+        nome_final = f'{base_nome}{sufixo}'
+        contador = 2
+        while nome_final.lower() in usados or (pasta_destino / nome_final).exists():
+            nome_final = f'{base_nome}_{contador}{sufixo}'
+            contador += 1
+
+        destino = pasta_destino / nome_final
+        destino.write_bytes(arq.read())
+        usados.add(nome_final.lower())
+        logs.append({
+            'tipo': tipo,
+            'arquivo_original': nome_original,
+            'arquivo_salvo': str(destino),
+            'status': 'Salvo',
+            'motivo': 'OK' if nome_final == nome_original else 'Renomeado para evitar sobrescrever arquivo duplicado'
+        })
+
+    return logs
+
+
+def diagnosticar_nfs(nfs):
+    logs = []
+    for nf in nfs:
+        problemas = []
+        if not nf.get('texto'):
+            problemas.append('Texto vazio: possível PDF escaneado/imagem, protegido ou sem camada de texto')
+        if not nf.get('fornecedor'):
+            problemas.append('Fornecedor não localizado')
+        if not nf.get('cnpj'):
+            problemas.append('CNPJ não localizado')
+        if nf.get('valor_bruto') is None:
+            problemas.append('Valor bruto não localizado')
+        logs.append({
+            'arquivo_nf': nf.get('arquivo',''),
+            'fornecedor': nf.get('fornecedor',''),
+            'cnpj': nf.get('cnpj',''),
+            'valor_bruto': nf.get('valor_bruto',''),
+            'status_leitura': 'OK' if not problemas else 'Atenção',
+            'observacao': ' | '.join(problemas) if problemas else 'Lido com sucesso'
+        })
+    return logs
+
+def limpar_tudo_app(apagar_saida=True):
+    pastas=[DIR_NFS, DIR_COMP, DIR_TMP, DIR_REL]
+    if apagar_saida:
+        pastas.append(DIR_SAIDA)
+    for pasta in pastas:
+        pasta.mkdir(parents=True, exist_ok=True)
+        for item in sorted(pasta.rglob('*'), reverse=True):
+            try:
+                if item.is_file(): item.unlink()
+                elif item.is_dir(): item.rmdir()
+            except Exception:
+                pass
+
 st.title('Conciliador NF x Comprovante')
-st.caption('V1.5 - match financeiro: CNPJ opcional, valor bruto/líquido estimado, texto completo e ranking.')
+st.caption('V1.5.4 - Excel corrigido + leitura corrigida de PDFs: aceita .PDF/.Pdf, evita sobrescrever nomes duplicados e gera diagnóstico.')
+st.warning('Use o botão abaixo antes de trocar o dia, lote ou pasta para não misturar arquivos anteriores.')
+col_limpar1, col_limpar2 = st.columns([1, 3])
+with col_limpar1:
+    if st.button('🧹 Limpar tudo / novo dia', type='secondary'):
+        limpar_tudo_app(apagar_saida=True)
+        st.success('Tudo limpo. Agora você pode enviar o novo lote de NFs e comprovantes.')
+        st.stop()
+
 col1,col2=st.columns(2)
 with col1: arquivos_nf=st.file_uploader('Enviar PDFs das NFs', type=['pdf'], accept_multiple_files=True)
 with col2: arquivos_comp=st.file_uploader('Enviar lote(s) de comprovantes', type=['pdf'], accept_multiple_files=True)
@@ -219,12 +341,29 @@ if st.button('Processar conciliação', type='primary'):
                 if arq.is_file(): arq.unlink()
         pasta.mkdir(parents=True, exist_ok=True)
     if not arquivos_nf or not arquivos_comp: st.error('Envie pelo menos uma NF e um lote de comprovantes.'); st.stop()
-    for arq in arquivos_nf: (DIR_NFS/arq.name).write_bytes(arq.read())
-    for arq in arquivos_comp: (DIR_COMP/arq.name).write_bytes(arq.read())
-    with st.spinner('Lendo NFs...'): nfs=[ler_nf(p) for p in DIR_NFS.glob('*.pdf')]
+    log_uploads = []
+    log_uploads.extend(salvar_uploads_unicos(arquivos_nf, DIR_NFS, 'NF'))
+    log_uploads.extend(salvar_uploads_unicos(arquivos_comp, DIR_COMP, 'Comprovante'))
+
+    pdfs_nf = listar_pdfs(DIR_NFS)
+    pdfs_comp = listar_pdfs(DIR_COMP)
+
+    with st.spinner('Lendo NFs...'):
+        nfs=[]
+        for p in pdfs_nf:
+            try:
+                nfs.append(ler_nf(p))
+            except Exception as e:
+                nfs.append({'arquivo': str(p), 'texto': '', 'numero_nf': '', 'fornecedor': '', 'fornecedor_norm': '', 'cnpj': '', 'valor_bruto': None, 'valor_liquido_estimado': None, 'retencoes': {}, 'data_emissao_ou_primeira_data': '', 'tokens_nome': set(), 'tokens_texto': set(), 'erro_leitura': str(e)})
+
     with st.spinner('Lendo e separando comprovantes...'):
         comps=[]
-        for p in DIR_COMP.glob('*.pdf'): comps.extend(ler_comprovantes(p))
+        erros_comprovantes=[]
+        for p in pdfs_comp:
+            try:
+                comps.extend(ler_comprovantes(p))
+            except Exception as e:
+                erros_comprovantes.append({'arquivo_comprovante': str(p), 'status': 'Erro', 'motivo': str(e)})
     with st.spinner('Calculando associação financeira...'): resultados,usados=conciliar(nfs,comps,lim_auto,lim_manual)
     registros=[]; pasta_saida=Path(pasta_saida_txt); pasta_saida.mkdir(parents=True, exist_ok=True)
     for r in resultados:
@@ -235,13 +374,25 @@ if st.button('Processar conciliação', type='primary'):
             sc,mot,simn,simt,c=cand; registros.append(linha(f'Candidato {pos}',sc,mot,round(simn,2),round(simt,2),nf,c,'',f'Candidato {pos}',False))
     for c in comps:
         if c['arquivo_pagina'] not in usados: registros.append(linha('Comprovante sem NF automática','','','','',None,c,'','Sobra comprovante',False))
-    df=pd.DataFrame(registros); rel=DIR_REL/f"relatorio_conciliacao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    df=limpar_dataframe_excel(pd.DataFrame(registros)); rel=DIR_REL/f"relatorio_conciliacao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     with pd.ExcelWriter(rel, engine='openpyxl') as writer:
         df.to_excel(writer,index=False,sheet_name='Resultado')
-        pd.DataFrame(nfs).drop(columns=['texto','tokens_nome','tokens_texto'], errors='ignore').to_excel(writer,index=False,sheet_name='NFs_lidas')
-        pd.DataFrame(comps).drop(columns=['texto','tokens_nome','tokens_texto'], errors='ignore').to_excel(writer,index=False,sheet_name='Comprovantes_lidos')
+        limpar_dataframe_excel(pd.DataFrame(nfs).drop(columns=['texto','tokens_nome','tokens_texto'], errors='ignore')).to_excel(writer,index=False,sheet_name='NFs_lidas')
+        limpar_dataframe_excel(pd.DataFrame(comps).drop(columns=['texto','tokens_nome','tokens_texto'], errors='ignore')).to_excel(writer,index=False,sheet_name='Comprovantes_lidos')
+        limpar_dataframe_excel(pd.DataFrame(log_uploads)).to_excel(writer,index=False,sheet_name='Uploads')
+        limpar_dataframe_excel(pd.DataFrame(diagnosticar_nfs(nfs))).to_excel(writer,index=False,sheet_name='Diagnostico_NFs')
+        limpar_dataframe_excel(pd.DataFrame(erros_comprovantes)).to_excel(writer,index=False,sheet_name='Erros_Comprovantes')
     st.success('Processamento concluído.')
-    m1,m2,m3,m4=st.columns(4); m1.metric('NFs lidas',len(nfs)); m2.metric('Comprovantes lidos',len(comps)); m3.metric('Conciliados',len([r for r in resultados if r['status']=='Conciliado'])); m4.metric('Conferir manualmente',len([r for r in resultados if r['status']=='Conferir manualmente']))
+    m1,m2,m3,m4,m5=st.columns(5)
+    m1.metric('Arquivos NF enviados',len(arquivos_nf or []))
+    m2.metric('PDFs NF salvos',len(pdfs_nf))
+    m3.metric('Comprovantes/páginas lidos',len(comps))
+    m4.metric('Conciliados',len([r for r in resultados if r['status']=='Conciliado']))
+    m5.metric('Conferir manualmente',len([r for r in resultados if r['status']=='Conferir manualmente']))
+
+    nfs_com_alerta = [x for x in diagnosticar_nfs(nfs) if x['status_leitura'] != 'OK']
+    if nfs_com_alerta:
+        st.warning(f'{len(nfs_com_alerta)} NF(s) foram salvas, mas tiveram leitura incompleta. Veja a aba Diagnostico_NFs no Excel.')
     st.dataframe(df,use_container_width=True)
     with open(rel,'rb') as f: st.download_button('Baixar relatório Excel', f, file_name=rel.name)
     st.download_button('Baixar PDFs conciliados em ZIP', data=zipar_pasta(pasta_saida), file_name='pdfs_conciliados.zip', mime='application/zip')
