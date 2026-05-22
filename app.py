@@ -13,6 +13,20 @@ st.set_page_config(page_title="Conciliador NF x Comprovante", layout="wide")
 BASE_DIR=Path(__file__).parent
 DIR_NFS=BASE_DIR/'entrada'/'nfs'; DIR_COMP=BASE_DIR/'entrada'/'comprovantes'; DIR_TMP=BASE_DIR/'temporario'; DIR_REL=BASE_DIR/'relatorios'; DIR_SAIDA=BASE_DIR/'saida'/'conciliados'
 for p in [DIR_NFS,DIR_COMP,DIR_TMP,DIR_REL,DIR_SAIDA]: p.mkdir(parents=True, exist_ok=True)
+
+
+def limpar_para_excel(valor):
+    # Remove caracteres invisíveis/controle que o openpyxl não aceita no Excel.
+    # Corrige: openpyxl.utils.exceptions.IllegalCharacterError
+    if isinstance(valor, str):
+        valor = re.sub(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]", "", valor)
+        return valor[:32000]
+    return valor
+
+
+def limpar_dataframe_excel(df):
+    return df.map(limpar_para_excel) if hasattr(df, "map") else df.applymap(limpar_para_excel)
+
 STOPWORDS={"LTDA","EIRELI","ME","EPP","SA","S/A","SERVICOS","SERVIÇOS","SERVICO","SERVIÇO","ADMINISTRATIVOS","ADMINISTRATIVO","COMERCIO","COMÉRCIO","INDUSTRIA","INDÚSTRIA","REPRESENTACOES","REPRESENTAÇÕES","PRODUTOS","MEDICOS","MÉDICOS","HOSPITALARES","CONSULTORIA","EMPRESARIAL","DE","DA","DO","DAS","DOS","E","EM","PARA","COM"}
 
 def limpar_texto(t): return re.sub(r"\s+"," ",t or "").strip()
@@ -205,7 +219,7 @@ def linha(status,score,mot,simn,simt,nf,comp,pdf='',tipo='Resultado',empate=Fals
     return {'tipo_linha':tipo,'status':status,'score':score,'empate_proximo':'Sim' if empate else 'Não','motivos_match':mot,'similaridade_nome':simn,'similaridade_texto':simt,'nf_numero':nf.get('numero_nf','') if nf else '','nf_fornecedor':nf.get('fornecedor','') if nf else '','nf_cnpj':nf.get('cnpj','') if nf else '','nf_valor_bruto':nf.get('valor_bruto','') if nf else '','nf_valor_bruto_formatado':formatar_valor(nf.get('valor_bruto')) if nf else '','nf_valor_liquido_estimado':nf.get('valor_liquido_estimado','') if nf else '','nf_valor_liquido_formatado':formatar_valor(nf.get('valor_liquido_estimado')) if nf else '','nf_retencoes_estimadas':nf.get('retencoes',{}).get('total_retencoes','') if nf else '','nf_data':nf.get('data_emissao_ou_primeira_data','') if nf else '','comprovante_beneficiario':comp.get('beneficiario','') if comp else '','comprovante_doc':comp.get('cnpj_cpf','') if comp else '','comprovante_valor':comp.get('valor','') if comp else '','comprovante_valor_formatado':formatar_valor(comp.get('valor')) if comp else '','data_pagamento':comp.get('data_pagamento','') if comp else '','documento_banco':comp.get('documento_banco','') if comp else '','pagina_comprovante':comp.get('pagina','') if comp else '','arquivo_nf':nf.get('arquivo','') if nf else '','arquivo_comprovante':comp.get('arquivo_pagina','') if comp else '','pdf_final':pdf,'texto_nf_resumo':(nf.get('texto','')[:700] if nf and nf.get('texto') else ''),'texto_comprovante_resumo':(comp.get('texto','')[:700] if comp and comp.get('texto') else '')}
 
 st.title('Conciliador NF x Comprovante')
-st.caption('V1.5 - match financeiro: CNPJ opcional, valor bruto/líquido estimado, texto completo e ranking.')
+st.caption('V1.5.1 - match financeiro: CNPJ opcional, valor bruto/líquido estimado, texto completo e ranking.')
 col1,col2=st.columns(2)
 with col1: arquivos_nf=st.file_uploader('Enviar PDFs das NFs', type=['pdf'], accept_multiple_files=True)
 with col2: arquivos_comp=st.file_uploader('Enviar lote(s) de comprovantes', type=['pdf'], accept_multiple_files=True)
@@ -235,7 +249,7 @@ if st.button('Processar conciliação', type='primary'):
             sc,mot,simn,simt,c=cand; registros.append(linha(f'Candidato {pos}',sc,mot,round(simn,2),round(simt,2),nf,c,'',f'Candidato {pos}',False))
     for c in comps:
         if c['arquivo_pagina'] not in usados: registros.append(linha('Comprovante sem NF automática','','','','',None,c,'','Sobra comprovante',False))
-    df=pd.DataFrame(registros); rel=DIR_REL/f"relatorio_conciliacao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    df=limpar_dataframe_excel(pd.DataFrame(registros)); rel=DIR_REL/f"relatorio_conciliacao_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     with pd.ExcelWriter(rel, engine='openpyxl') as writer:
         df.to_excel(writer,index=False,sheet_name='Resultado')
         pd.DataFrame(nfs).drop(columns=['texto','tokens_nome','tokens_texto'], errors='ignore').to_excel(writer,index=False,sheet_name='NFs_lidas')
