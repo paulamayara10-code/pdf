@@ -50,6 +50,39 @@ def normalizar_nome(txt):
     return " ".join(partes)
 
 
+def tokens_relevantes_texto(txt):
+    """
+    Extrai palavras úteis do texto inteiro da NF/comprovante.
+    Isso ajuda quando o nome do fornecedor não está claro no título/cabeçalho,
+    mas aparece na discriminação, corpo da NF, razão social, endereço, observação etc.
+    """
+    txt = normalizar_nome(txt)
+    tokens = []
+    for t in txt.split():
+        if len(t) >= 4 and not t.isdigit() and t not in STOPWORDS:
+            tokens.append(t)
+    return set(tokens)
+
+
+def score_texto_completo(texto_nf, texto_comp):
+    """
+    Compara o texto completo da NF contra o texto do comprovante.
+    Usa duas técnicas:
+    1. similaridade fuzzy do texto normalizado;
+    2. interseção de palavras-chave relevantes.
+    """
+    nf_norm = normalizar_nome(texto_nf)
+    comp_norm = normalizar_nome(texto_comp)
+
+    fuzzy = fuzz.token_set_ratio(nf_norm[:3000], comp_norm[:3000])
+
+    tk_nf = tokens_relevantes_texto(texto_nf)
+    tk_cp = tokens_relevantes_texto(texto_comp)
+    comuns = tk_nf & tk_cp
+
+    return fuzzy, comuns
+
+
 def somente_numeros(txt):
     return re.sub(r"\D", "", str(txt or ""))
 
@@ -157,6 +190,7 @@ def ler_nf(caminho):
         "cnpj": cnpjs[0] if cnpjs else "",
         "valor": extrair_valor_nf(texto),
         "tokens_nome": set(normalizar_nome(extrair_fornecedor_nf(texto)).split()),
+        "tokens_texto": tokens_relevantes_texto(texto),
     }
 
 
@@ -252,6 +286,7 @@ def ler_comprovantes(caminho_pdf):
                 "valor": extrair_valor_comp(texto),
                 "data_pagamento": extrair_data_comp(texto),
                 "documento_banco": extrair_documento_banco(texto),
+                "tokens_texto": tokens_relevantes_texto(texto),
             })
     return comps
 
@@ -315,10 +350,29 @@ def score_match(nf, comp):
 
     # 5. Número NF/RPS/documento dentro do texto do comprovante
     num_nf = somente_numeros(nf.get("numero_nf"))
-    texto_comp = somente_numeros(comp.get("texto"))
-    if num_nf and len(num_nf) >= 2 and num_nf in texto_comp:
+    texto_comp_num = somente_numeros(comp.get("texto"))
+    if num_nf and len(num_nf) >= 2 and num_nf in texto_comp_num:
         pontos += 10
         motivos.append("Número da NF/RPS localizado no comprovante")
+
+    # 6. Texto completo da NF x texto completo do comprovante
+    # Importante quando o nome não vem no título/arquivo e aparece apenas dentro do PDF.
+    sim_texto, palavras_texto = score_texto_completo(nf.get("texto", ""), comp.get("texto", ""))
+
+    if sim_texto >= 70:
+        pontos += 12
+        motivos.append(f"Texto completo da NF parecido com comprovante ({sim_texto:.0f}%)")
+    elif sim_texto >= 55:
+        pontos += 7
+        motivos.append(f"Texto completo parcialmente parecido ({sim_texto:.0f}%)")
+
+    palavras_boas = [p for p in palavras_texto if len(p) >= 5]
+    if len(palavras_boas) >= 4:
+        pontos += 12
+        motivos.append("Texto da NF possui várias palavras em comum com o comprovante")
+    elif len(palavras_boas) >= 2:
+        pontos += 7
+        motivos.append("Texto da NF possui palavras em comum com o comprovante")
 
     return min(pontos, 100), " | ".join(motivos), sim
 
@@ -393,7 +447,7 @@ def zipar_pasta(pasta):
 # INTERFACE
 # =========================
 st.title("Conciliador NF x Comprovante")
-st.caption("V1.3 - match expandido por nome, valor, CNPJ, palavras-chave, NF/RPS e ranking de candidatos.")
+st.caption("V1.4 - match pelo texto completo da NF + nome, valor, CNPJ, palavras-chave, NF/RPS e ranking de candidatos.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -403,8 +457,8 @@ with col2:
 
 with st.expander("Configurações avançadas", expanded=True):
     c1, c2, c3 = st.columns(3)
-    limite_auto = c1.slider("Score para conciliar automático", 0, 100, 72)
-    limite_manual = c2.slider("Score para enviar à conferência", 0, 100, 45)
+    limite_auto = c1.slider("Score para conciliar automático", 0, 100, 68)
+    limite_manual = c2.slider("Score para enviar à conferência", 0, 100, 38)
     pasta_saida_txt = c3.text_input(
         "Pasta de saída dos PDFs unidos",
         value=str(BASE_DIR / "saida" / "conciliados")
@@ -454,6 +508,7 @@ if st.button("Processar conciliação", type="primary"):
             "score": r["score"],
             "motivos_match": r["motivos"],
             "similaridade_nome": r["similaridade_nome"],
+            "texto_nf_resumo": (nf.get("texto", "")[:500] if nf.get("texto") else ""),
             "nf_numero": nf.get("numero_nf", ""),
             "nf_fornecedor": nf.get("fornecedor", ""),
             "nf_cnpj": nf.get("cnpj", ""),
@@ -478,6 +533,7 @@ if st.button("Processar conciliação", type="primary"):
                 "score": sc,
                 "motivos_match": motivos,
                 "similaridade_nome": round(sim, 2),
+                "texto_nf_resumo": (nf.get("texto", "")[:500] if nf.get("texto") else ""),
                 "nf_numero": nf.get("numero_nf", ""),
                 "nf_fornecedor": nf.get("fornecedor", ""),
                 "nf_cnpj": nf.get("cnpj", ""),
@@ -501,6 +557,7 @@ if st.button("Processar conciliação", type="primary"):
                 "score": "",
                 "motivos_match": "",
                 "similaridade_nome": "",
+                "texto_nf_resumo": "",
                 "nf_numero": "",
                 "nf_fornecedor": "",
                 "nf_cnpj": "",
